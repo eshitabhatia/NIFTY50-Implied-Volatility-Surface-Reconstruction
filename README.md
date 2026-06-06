@@ -1,5 +1,5 @@
-cat > /mnt/user-data/outputs/README.md << 'EOF'
-# nifty50-iv-surface-reconstruction
+
+### Nifty50 IV Surface Reconstruction
 
 **Finance Club IIT Roorkee — Open Project 2026**
 
