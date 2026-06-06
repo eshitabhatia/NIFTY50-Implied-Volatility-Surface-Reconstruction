@@ -5,13 +5,13 @@
 
 Reconstructing missing implied volatility values across a NIFTY50 options surface using a two-stage spline + gradient boosting pipeline.
 
-**Best public score: MSE = 0.0000380**
+**Best public score: MSE = 0.0000389346**
 
 ---
 
 ## The problem
 
-Options prices are quoted in implied volatility (IV) rather than rupees. A full IV surface maps how this number varies across strike prices and time — it is the foundation of every options pricing and risk management system.
+Options prices are quoted in implied volatility (IV) rather than rupees. A full IV surface maps how this number varies across strike prices and time,it is the foundation of every options pricing and risk management system.
 
 The dataset is a 975 × 28 matrix: 975 five-minute bars across 13 trading days (January 7–27, 2026) and 28 NIFTY50 option strikes (14 calls from 25200 to 26500, 14 puts from 23800 to 25100), all expiring January 27, 2026. About 19% of entries are missing — concentrated in illiquid deep-OTM strikes and early-session bars — and the task is to fill every gap. The evaluation metric is mean squared error on a hidden test set (30% public, 70% private).
 
@@ -21,11 +21,11 @@ The dataset is a 975 × 28 matrix: 975 five-minute bars across 13 trading days (
 
 The pipeline has two stages.
 
-**Stage 1 — Volatility smile interpolation.** At any given moment, all 14 call IVs lie on a smooth U-shaped curve called the volatility smile. If 10 of the 14 strikes are observed, I can fit that curve and read off the 4 missing values. This is a purely cross-sectional operation — only same-row data is used, so there is zero temporal lookahead.
+**1)Volatility smile interpolation.** At any given moment, all 14 call IVs lie on a smooth U-shaped curve called the volatility smile. If 10 of the 14 strikes are observed, I can fit that curve and read off the 4 missing values. This is a purely cross-sectional operation — only same-row data is used, so there is zero temporal lookahead.
 
 The interpolator blends quadratic and linear fits. Quadratic splines can overshoot badly at the wings where data is sparse, so the blend is asymmetric: 60% quadratic + 40% linear for interior strikes, and 85% linear + 15% quadratic for extrapolation. The spline estimate is further blended with an exponentially-weighted moving average of each strike's recent history (90% spline, 10% EWMA on normal days; 100% spline on expiry day where past IV levels are irrelevant).
 
-**Stage 2 — Gradient boosting residual correction.** The spline has systematic errors that correlate with moneyness zone, time of day, and recent IV dynamics. A LightGBM + CatBoost ensemble (50/50) predicts these residuals from 47 engineered features. The final prediction is:
+**2Gradient boosting residual correction.** The spline has systematic errors that correlate with moneyness zone, time of day, and recent IV dynamics. A LightGBM + CatBoost ensemble (50/50) predicts these residuals from 47 engineered features. The final prediction is:
 
 IV_final = spline_pred + α(zone) × (0.50 × LightGBM + 0.50 × CatBoost)
 
@@ -52,6 +52,8 @@ A controlled error analysis (hiding 20% of observed cells and measuring spline e
 | Deep OTM | ≥ 0.05 | 0.14 |
 
 The moderate OTM zone is the inflection point of the smile where curvature is highest — the spline systematically under-corrects there. Raising the correction alpha to 0.90 for that zone gave a confirmed leaderboard improvement.
+
+Final alpha values:
 
 Final alpha values:
 
@@ -114,7 +116,7 @@ The common thread in every failure: the local simulation hides random observed c
 
 ## How to run
 
-1. Upload `iv_surface_REFACTORED.ipynb` to Kaggle
+1. Upload `iv-surface-final.ipynb` to Kaggle
 2. Add data source: **finclub-open-project-26**
 3. Accelerator: None (CPU only, no GPU needed)
 4. Session → Restart and Run All
