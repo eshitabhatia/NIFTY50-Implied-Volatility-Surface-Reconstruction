@@ -1,9 +1,6 @@
+# nifty50-iv-surface-reconstruction
 
-### Nifty50 IV Surface Reconstruction
-
-**Finance Club IIT Roorkee — Open Project 2026**
-
-Reconstructing missing implied volatility values across a NIFTY50 options surface using a two-stage spline + gradient boosting pipeline.
+A two-step pipeline for reconstructing missing implied volatility values across a NIFTY50 options surface, combining volatility smile interpolation with a gradient boosting residual correction ensemble.
 
 **Best public score: MSE = 0.0000389346**
 
@@ -11,130 +8,167 @@ Reconstructing missing implied volatility values across a NIFTY50 options surfac
 
 ## The problem
 
-Options prices are quoted in implied volatility (IV) rather than rupees. A full IV surface maps how this number varies across strike prices and time,it is the foundation of every options pricing and risk management system.
+Options traders do not quote prices in rupees — they quote implied volatility (IV). A complete IV surface maps how this number varies across strike prices and time, and it is the foundation of every options pricing and risk management system in practice.
 
-The dataset is a 975 × 28 matrix: 975 five-minute bars across 13 trading days (January 7–27, 2026) and 28 NIFTY50 option strikes (14 calls from 25200 to 26500, 14 puts from 23800 to 25100), all expiring January 27, 2026. About 19% of entries are missing — concentrated in illiquid deep-OTM strikes and early-session bars — and the task is to fill every gap. The evaluation metric is mean squared error on a hidden test set (30% public, 70% private).
+The dataset is a 975 × 28 matrix of five-minute IV observations across 13 trading days (January 7–27, 2026) for 28 NIFTY50 option strikes: 14 calls from 25200 to 26500, and 14 puts from 23800 to 25100, all expiring January 27, 2026. About 19% of the matrix is missing, concentrated in illiquid deep-OTM strikes and early-session bars. The task is to fill every gap as accurately as possible, measured by MSE against a hidden test set (30% public leaderboard, 70% private).
 
 ---
 
-## Solution overview
+## Approach
 
-The pipeline has two stages.
+The solution is a two-step pipeline grounded in how options markets actually work.
 
-**1)Volatility smile interpolation.** At any given moment, all 14 call IVs lie on a smooth U-shaped curve called the volatility smile. If 10 of the 14 strikes are observed, I can fit that curve and read off the 4 missing values. This is a purely cross-sectional operation — only same-row data is used, so there is zero temporal lookahead.
+### Volatility Smile Interpolation
 
-The interpolator blends quadratic and linear fits. Quadratic splines can overshoot badly at the wings where data is sparse, so the blend is asymmetric: 60% quadratic + 40% linear for interior strikes, and 85% linear + 15% quadratic for extrapolation. The spline estimate is further blended with an exponentially-weighted moving average of each strike's recent history (90% spline, 10% EWMA on normal days; 100% spline on expiry day where past IV levels are irrelevant).
+At any fixed point in time, all 14 call IVs lie on a smooth U-shaped curve called the volatility smile. Near-the-money options have the lowest IV; it rises symmetrically on both wings. If 10 of the 14 strikes are observed at a given timestamp, I can fit this curve and read off the 4 missing values with reasonable accuracy.
 
-**2Gradient boosting residual correction.** The spline has systematic errors that correlate with moneyness zone, time of day, and recent IV dynamics. A LightGBM + CatBoost ensemble (50/50) predicts these residuals from 47 engineered features. The final prediction is:
+The interpolator blends quadratic and linear fits. Quadratic splines can overshoot badly at the wings where data is sparsest, so the blend is asymmetric:
 
+- **Interior strikes** (target between observed strikes): 60% quadratic + 40% linear
+- **Wing strikes** (extrapolation beyond observed range): 85% linear + 15% quadratic
+- **Normal day final prediction**: 90% spline + 10% exponentially-weighted moving average of recent history for stability
+- **Expiry day**: 100% spline — past IV levels are irrelevant when gamma is exploding
+
+This stage uses only data from the same row. No past or future timestamps are accessed anywhere, making it completely lookahead-free.
+
+### Gradient Boosting Residual Correction
+
+The spline has systematic errors that correlate with moneyness zone, time of day, and recent IV dynamics. A LightGBM + CatBoost ensemble (50/50) learns to predict these residuals from 47 engineered features. The final prediction formula is:
+
+```
 IV_final = spline_pred + α(zone) × (0.50 × LightGBM + 0.50 × CatBoost)
+```
 
-Three separate models handle the three distinct regimes in the data: CE calls, PE puts, and expiry day.
+Three separate models handle the three distinct regimes in the data.
 
 ---
 
 ## Why three separate models
 
-**CE vs PE.** Call residuals have 3.6× higher standard deviation than put residuals. A single shared model would over-index on call patterns and systematically underfit puts.
+**CE calls vs PE puts.** Call residuals have 3.6× higher standard deviation than put residuals — visible directly in the training data. A single shared model over-indexes on call patterns and systematically underfits puts. Separating them immediately improved the leaderboard score.
 
-**Expiry day.** On January 27 (DTE = 0), gamma explodes and IV can jump from 1.5 to 5+ in the final 30 minutes as each 5-minute bar represents a larger fraction of remaining time value. A model trained on the previous 12 normal trading days has never seen this dynamic. The expiry model uses `num_leaves=7` and `reg_lambda=4.0` — much shallower and more regularised — because the training set has only ~1,350 rows and is highly non-stationary.
+**Expiry day.** On January 27 (DTE = 0), gamma explodes as time value evaporates. IV can legitimately jump from 0.5 to 5+ in the final 30 minutes as each 5-minute bar represents an ever-larger fraction of remaining time. A model trained on the previous 12 normal trading days has never seen this dynamic and makes large errors on expiry. The dedicated expiry model uses `num_leaves=7` and `reg_lambda=4.0` — much shallower and more regularised than the CE/PE models — because its training set has only ~1,350 rows and is highly non-stationary.
 
 ---
 
-## Zone-based correction alpha for CE calls
+## Zone-based alpha for CE calls
 
-A controlled error analysis (hiding 20% of observed cells and measuring spline error by moneyness zone) revealed a strong pattern:
+A controlled error analysis — hiding 20% of observed cells and measuring spline error by moneyness zone — revealed a strong pattern in where the spline fails:
 
-| Zone | |log-moneyness| | Spline MSE × 10⁶ |
+| Zone | \|log-moneyness\| range | Spline MSE × 10⁶ |
 |---|---|---|
 | Near ATM | < 0.02 | 0.55 |
 | Moderate OTM | 0.02 – 0.05 | 2.81 |
 | Deep OTM | ≥ 0.05 | 0.14 |
 
-The moderate OTM zone is the inflection point of the smile where curvature is highest — the spline systematically under-corrects there. Raising the correction alpha to 0.90 for that zone gave a confirmed leaderboard improvement.
+The moderate OTM zone sits at the inflection point of the smile where curvature changes most rapidly. The spline systematically under-corrects there. Raising the correction weight to 0.90 specifically for that zone gave a confirmed leaderboard improvement. The final alpha values used in production:
 
-Final alpha values:
-
-Final alpha values:
-
-| Region | Alpha |
+| Region | Weight (α) |
 |---|---|
-| CE near ATM (|lm| < 0.02) | 0.70 |
-| CE moderate OTM (0.02–0.05) | 0.90 |
-| CE deep OTM (|lm| ≥ 0.05) | 0.70 |
-| PE puts (all zones) | 0.60 |
+| CE near ATM (\|lm\| < 0.02) | 0.70 |
+| CE moderate OTM (0.02 – 0.05) | 0.90 |
+| CE deep OTM (\|lm\| ≥ 0.05) | 0.70 |
+| PE puts (uniform across all zones) | 0.60 |
 | Expiry day | 0.45 |
 
 ---
 
-## Features
+## Feature engineering
 
 47 features across five groups, all strictly lookahead-free.
 
-* **Smile position (5):** log-moneyness, moneyness, volatility-standardised moneyness, strike rank, is_call. These tell the model where on the smile curve this cell sits.
-* **Term structure (5):** DTE, bar index (0–74), fractional session position, trading day number, early-day flag. DTE is the most important single feature — the relationship between DTE and gamma is highly nonlinear.
-* **Surface shape (16):** ATM IV level (calls, puts, and average), mean and minimum IV by type, observed count by type, smile skew (mean PE minus mean CE), surface dispersion, call and put curvature coefficients, wing ratio, boundary gap. All computed from the same row — zero temporal access.
-* **Time-series lags (8):** iv_lag1, iv_lag2, rolling means over 3 and 10 bars, velocity (first difference), and filled versions of each that substitute the spline estimate when the lag is unavailable at the start of each day.
-* **Market dynamics (2):** 5-minute log return of NIFTY50 (`shift(1)` — previous bar only), and its interaction with `is_call`. The leverage effect means downside market moves lift call IV more than put IV — this asymmetry is a genuine signal.
-* **Interaction terms (5):** `lag1_spline_ratio` (how much does the recent level deviate from the current spline?), `lm × spline_confidence`, `lm × neighbour_count`, `surface_dispersion × rank`, `log(DTE) × |lm|`.
+**Smile position (5 features)**
+Log-moneyness, moneyness, volatility-standardised moneyness, strike rank, is_call. These place the cell in the right position on the smile curve and normalise across different IV regimes.
 
-The lag buffer uses a read-before-append pattern: the history buffer is read (recording lag values) and only then is the current observation appended. This is the mechanism that guarantees lookahead freedom — current information cannot appear in its own lag features.
+**Term structure (5 features)**
+DTE (days to expiry), bar index (0–74 within the session), fractional session position, trading day number, early-day flag. DTE is the single most important feature — its relationship with gamma is highly nonlinear and becomes extreme on expiry day.
+
+**Surface shape (16 features)**
+ATM IV level (calls, puts, and average), mean and minimum IV by type, observed count by type, smile skew (mean PE minus mean CE), surface dispersion, call and put curvature coefficients, wing ratio (max IV divided by ATM IV), and boundary gap (max PE IV minus min CE IV). All computed from the same timestamp row — zero temporal access.
+
+**Time-series lags (8 features)**
+`iv_lag1`, `iv_lag2`, rolling means over 3 and 10 bars, velocity (first difference between consecutive bars), and filled versions of each that substitute the spline estimate when the lag is unavailable at the start of each trading day.
+
+**Market dynamics (2 features)**
+5-minute log return of NIFTY50 (computed with `shift(1)` so it always references the previous bar), and its interaction with `is_call`. The leverage effect means downside market moves lift call IV disproportionately — this asymmetry is a real, exploitable signal.
+
+**Interaction terms (5 features)**
+`lag1_spline_ratio` (how much does the recent IV level deviate from the current spline estimate?), `lm × spline_confidence`, `lm × neighbour_count`, `surface_dispersion × strike_rank`, `log(DTE) × |lm|`.
+
+The lag buffer uses a strict read-before-append pattern: the history buffer is read first — recording lag values for the current bar — and only then is the current observation appended to the buffer. This is the mechanism that guarantees all lag features are lookahead-free. Current information cannot appear in its own lag.
 
 ---
 
 ## Score progression
 
-Each row represents a confirmed Kaggle submission, not a local estimate.
+Every row is a confirmed Kaggle submission, not a local estimate.
 
-| Model | Public MSE |
+| Configuration | Public MSE |
 |---|---|
 | Spline baseline only | 0.0001631 |
 | + LightGBM residual correction | 0.0000425 |
 | + Separate CE / PE models | 0.0000403 |
-| + spot_ret1 and leverage interaction | 0.0000402 |
-| + CatBoost in ensemble | 0.0000398 |
-| + Zone-based alpha for CE | 0.0000396 |
-| + XGBoost (50/25/25 blend) | 0.0000395 |
-| LGB + CatBoost 50/50, mod OTM alpha = 0.90, expiry alpha = 0.45 | **0.0000380** |
+| + 5-minute return and leverage interaction feature | 0.0000402 |
+| + CatBoost added to ensemble | 0.0000398 |
+| + Zone-based alpha for CE calls | 0.0000396 |
+| + XGBoost (LGB 50% / CB 25% / XGB 25%) | 0.0000395 |
+| **LGB + CatBoost 50/50, moderate OTM alpha = 0.90, expiry alpha = 0.45** | **0.0000380** |
 
 ---
 
-## What failed
+## What did not work
 
-It is worth documenting what did not work, because most of the development time went into these.
+Most of the development time went into ideas that failed. They are documented here because the reasons they failed are instructive.
 
-* **PCHIP interpolation** — showed +1.2% improvement locally but −12.4% on Kaggle. Real missing cells cluster in illiquid strikes where PCHIP has no nearby anchors; the local simulation did not reproduce this.
-* **Bivariate splines across time and strike** — catastrophic locally (−1180% MSE). IV is not smooth across time at a fine scale.
-* **GP / SVD / NMF matrix completion** — all worse than the simple spline. These methods assume global low-rank structure that does not hold for a single-expiry surface over 13 days.
-* **Temporal scaling for expiry day** — +11% local improvement but doubled the error on Kaggle. The bug: the scaling prior used the last observed value for that strike, which on the first expiry bar is from a previous non-expiry day. Scaling a 0.15 normal-day IV by a 4× gamma factor produces garbage.
-* **Three-model ensemble (LGB + CatBoost + XGBoost)** — marginally better than two-model in one configuration but worse in another. The 50/50 LGB + CatBoost blend was more consistent.
-* **Multi-seed LGB averaging** — zero measured effect. LightGBM with fixed hyperparameters and fixed `random_state` produces very similar trees across seeds; there is not enough variance to benefit from averaging.
+**PCHIP interpolation** showed +1.2% improvement in local testing but −12.4% on the Kaggle leaderboard. Real missing cells cluster in illiquid strikes where PCHIP has no nearby anchor points. The local simulation hides random observed cells and creates artificially dense neighbourhoods that do not reflect this structure.
 
-The common thread in every failure: the local simulation hides random observed cells and creates artificially dense neighbourhoods around every missing cell. Real missing cells are in places where the entire neighbourhood is also sparse. Any method that requires nearby data to work will look better locally than it actually is.
+**Bivariate splines across time and strike** — catastrophic locally (−1180% MSE). IV is not smooth across time at a five-minute scale. The bivariate approach assumes joint smoothness in both dimensions simultaneously, which does not hold.
+
+**GP / SVD / NMF matrix completion** — all worse than the simple quadratic/linear spline. These methods assume global low-rank structure across the full matrix. A single-expiry surface over 13 days does not have this structure.
+
+**Temporal scaling for expiry day** — showed +11% improvement in local simulation but doubled the Kaggle error. The root cause was a bug: the scaling prior used the last observed value for each strike, which on the first expiry bar comes from a previous normal trading day. Scaling a 0.15 non-expiry IV by a 4× gamma factor produces 0.60, when the true expiry IV might be 0.18. The local simulation did not expose this because it always had same-day neighbours available.
+
+**Three-model ensemble (LGB + CatBoost + XGBoost)** — marginally better than two models in some configurations, worse in others. The 50/50 LGB + CatBoost blend was consistently more stable.
+
+**Multi-seed LGB averaging** — zero measured effect on either local validation or the leaderboard. LightGBM with fixed hyperparameters and a fixed `random_state` produces very similar trees across different seeds. There is not enough variance between seeds to benefit from averaging.
+
+The common thread: the local simulation creates a fundamentally different missingness pattern from the real competition data. Real missing cells are in places where the entire neighbourhood is also sparse. Any method that requires nearby observed data to function correctly will look better locally than it actually is. This pattern repeated itself throughout development and is the primary reason local validation results should not be trusted for this particular problem.
 
 ---
 
 ## How to run
 
-1. Upload `iv-surface-final.ipynb` to Kaggle
-2. Add data source: **finclub-open-project-26**
-3. Accelerator: None (CPU only, no GPU needed)
-4. Session → Restart and Run All
-5. Runtime: approximately 20–25 minutes
-6. Verify last cell prints: `Rows: 5460 | All positive: True | No NaN: True`
+1. Upload `iv-surface-final.ipynb` to a new Kaggle notebook
+2. Add the competition dataset: **Data → Add Data → finclub-open-project-26**
+3. Set accelerator to **None** (CPU only — GPU is not needed)
+4. Click **Session → Restart and Run All**
+5. Runtime is approximately 20–25 minutes
+6. Verify the final cell prints: `Rows: 5460 | All positive: True | No NaN: True`
 7. Submit `/kaggle/working/submission.csv`
 
-The notebook is fully deterministic: `random.seed(42)`, `np.random.seed(42)`, `random_state=42` on all models, fixed `n_estimators` for CE/PE (no early stopping), and a fixed interleaved split for the expiry model.
+The notebook is fully deterministic. `random.seed(42)` and `np.random.seed(42)` are set at the top. All models use `random_state=42`. CE and PE models use fixed `n_estimators` with no early stopping. The expiry model uses a fixed interleaved validation split (`index % 5 == 0`) which is deterministic given the fixed seed. Running the notebook twice produces identical output.
 
 ---
 
 ## Dependencies
 
-All available on Kaggle's default Python 3.10 kernel — no extra installation needed.
+All packages are available on Kaggle's default Python 3.10 kernel. No additional installation is required.
 
-pandas >= 1.5
-numpy >= 1.23
-scipy >= 1.9
-lightgbm >= 3.3
-catboost >= 1.1
+```
+pandas    >= 1.5
+numpy     >= 1.23
+scipy     >= 1.9
+lightgbm  >= 3.3
+catboost  >= 1.1
 matplotlib >= 3.5
+```
+
+---
+
+## Repository
+
+```
+nifty50-iv-surface-reconstruction/
+├── iv-surface-final.ipynb    Main notebook — reproduces submission.csv exactly
+└── README.md                 This file
+```
